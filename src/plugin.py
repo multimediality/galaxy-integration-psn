@@ -41,6 +41,9 @@ class PSNPlugin(Plugin):
             self.store_credentials,
         )
         self._owned_games_import: asyncio.Event | None = None
+        self._psn_client.attach_persistent_cache(
+            lambda: self.persistent_cache, self.push_cache
+        )
         logging.getLogger("urllib3").setLevel(logging.FATAL)
 
     async def authenticate(self, stored_credentials=None):
@@ -115,6 +118,7 @@ class PSNPlugin(Plugin):
             ]
         finally:
             self._owned_games_import.set()
+            self._psn_client.flush_cache()
 
     async def prepare_game_times_context(self, game_ids: List[str]) -> Any:
         await self._ensure_authenticated()
@@ -139,6 +143,7 @@ class PSNPlugin(Plugin):
         return await self._psn_client.fetch_unlocked_achievements(game_id, context)
 
     def achievements_import_complete(self):
+        self._psn_client.flush_cache()
         context = getattr(self, "_last_achievements_context", None)
         if context is None:
             return
@@ -159,6 +164,7 @@ class PSNPlugin(Plugin):
             return []
 
     async def shutdown(self):
+        self._psn_client.flush_cache()
         await self._authenticator.stop()
         await self._http_client.close()
 

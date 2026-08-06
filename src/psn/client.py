@@ -1,7 +1,8 @@
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 from galaxy.api.errors import (
@@ -52,6 +53,13 @@ logger = logging.getLogger(__name__)
 
 STORE_TITLE_PREFIXES = ("CUSA", "PPSA", "PCSE", "PCSA")
 
+# persistent_cache keys (bump the suffix when the stored shape changes)
+CACHE_PURCHASED = "purchased_v1"
+CACHE_PLAYED = "played_v1"
+CACHE_TROPHY_TITLES = "trophy_titles_v1"
+CACHE_TROPHIES = "trophies_v1"
+CACHE_STORE_TROPHY_MAP = "store_trophy_map_v1"
+
 
 FRIENDS_PROFILE_BATCH = 8
 
@@ -91,6 +99,46 @@ class PSNClient:
         self._trophy_title_index: Dict[str, Dict[str, str]] = {}
         self._concept_siblings: Dict[str, List[str]] = {}
         self._trophy_semaphore = asyncio.Semaphore(TROPHY_FETCH_CONCURRENCY)
+        self._persistent_cache: Optional[Callable[[], dict]] = None
+        self._push_cache: Optional[Callable[[], None]] = None
+        self._cache_dirty = False
+        self._trophy_cache: Optional[Dict[str, dict]] = None
+        self._store_trophy_map: Optional[Dict[str, List[dict]]] = None
+
+    def attach_persistent_cache(
+        self, getter: Callable[[], dict], pusher: Callable[[], None]
+    ):
+        """Wire Galaxy's persistent_cache so syncs survive Sony API outages."""
+        self._persistent_cache = getter
+        self._push_cache = pusher
+
+    def _cache_load(self, key: str, default):
+        if self._persistent_cache is None:
+            return default
+        try:
+            raw = self._persistent_cache().get(key)
+            return json.loads(raw) if raw else default
+        except Exception:
+            logger.warning("Could not read persistent cache key %s", key, exc_info=True)
+            return default
+
+    def _cache_store(self, key: str, value):
+        if self._persistent_cache is None:
+            return
+        try:
+            self._persistent_cache()[key] = json.dumps(value)
+            self._cache_dirty = True
+        except Exception:
+            logger.warning("Could not write persistent cache key %s", key, exc_info=True)
+
+    def flush_cache(self):
+        if self._cache_dirty and self._push_cache is not None:
+            try:
+                self._push_cache()
+            except Exception:
+                logger.warning("Could not push persistent cache", exc_info=True)
+            else:
+                self._cache_dirty = False
 
     def set_account_id(self, account_id: str):
         self._account_id = str(account_id)
@@ -157,19 +205,31 @@ class PSNClient:
             raise UnknownBackendResponse(str(exc)) from exc
 
     async def get_purchased_games(self) -> List[Dict[str, str]]:
-        all_games: List[Dict[str, str]] = []
-        start = 0
-        page = DEFAULT_PAGE_SIZE
-        while True:
-            response = await self._http_client.graphql_get(
-                purchased_games_url(start=start, size=page)
+        try:
+            all_games: List[Dict[str, str]] = []
+            start = 0
+            page = DEFAULT_PAGE_SIZE
+            while True:
+                response = await self._http_client.graphql_get(
+                    purchased_games_url(start=start, size=page)
+                )
+                batch = self._parse_purchased(response)
+                all_games.extend(batch)
+                logger.info("Fetched %d purchased games (start=%d)", len(batch), start)
+                if len(batch) < page:
+                    break
+                start += page
+        except Exception:
+            cached = self._cache_load(CACHE_PURCHASED, None)
+            if cached is None:
+                raise
+            logger.warning(
+                "Purchased games fetch failed; using %d cached entries",
+                len(cached),
+                exc_info=True,
             )
-            batch = self._parse_purchased(response)
-            all_games.extend(batch)
-            logger.info("Fetched %d purchased games (start=%d)", len(batch), start)
-            if len(batch) < page:
-                break
-            start += page
+            return cached
+        self._cache_store(CACHE_PURCHASED, all_games)
         return all_games
 
     async def get_played_games_graphql(self) -> List[Dict[str, str]]:
@@ -188,83 +248,128 @@ class PSNClient:
         except (KeyError, TypeError, AttributeError) as exc:
             raise UnknownBackendResponse(str(exc)) from exc
 
+    @staticmethod
+    def _slim_played_title(title: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only the fields the plugin uses so the persistent cache stays small."""
+        concept = title.get("concept") or {}
+        return {
+            "titleId": title.get("titleId"),
+            "name": title.get("name"),
+            "localizedName": title.get("localizedName"),
+            "category": title.get("category"),
+            "playDuration": title.get("playDuration"),
+            "lastPlayedDateTime": title.get("lastPlayedDateTime"),
+            "concept": {
+                "id": concept.get("id"),
+                "name": concept.get("name"),
+                "titleIds": concept.get("titleIds") or [],
+            },
+        }
+
     async def get_played_games(self) -> List[Dict[str, Any]]:
         if self._played_games_cache is not None:
             return self._played_games_cache
 
-        all_titles: List[Dict[str, Any]] = []
-        offset = 0
-        page = PLAYED_GAMES_PAGE_SIZE
-        skipped_unknown = 0
-        while True:
-            response = await self._http_client.api_get(
-                rest_played_games_url(limit=page, offset=offset)
+        try:
+            all_titles: List[Dict[str, Any]] = []
+            offset = 0
+            page = PLAYED_GAMES_PAGE_SIZE
+            skipped_unknown = 0
+            while True:
+                response = await self._http_client.api_get(
+                    rest_played_games_url(limit=page, offset=offset)
+                )
+                titles = response.get("titles") or []
+                for title in titles:
+                    if title.get("category") == "unknown":
+                        if not pick_display_name(
+                            title.get("name"),
+                            title.get("localizedName"),
+                            (title.get("concept") or {}).get("name"),
+                        ):
+                            skipped_unknown += 1
+                            continue
+                    all_titles.append(self._slim_played_title(title))
+                logger.info(
+                    "Fetched %d played games (offset=%d, skipped_unknown=%d)",
+                    len(titles),
+                    offset,
+                    skipped_unknown,
+                )
+                if len(titles) < page:
+                    break
+                offset += page
+        except Exception:
+            cached = self._cache_load(CACHE_PLAYED, None)
+            if cached is None:
+                raise
+            logger.warning(
+                "Played games fetch failed; using %d cached entries",
+                len(cached),
+                exc_info=True,
             )
-            titles = response.get("titles") or []
-            for title in titles:
-                if title.get("category") == "unknown":
-                    if not pick_display_name(
-                        title.get("name"),
-                        title.get("localizedName"),
-                        (title.get("concept") or {}).get("name"),
-                    ):
-                        skipped_unknown += 1
-                        continue
-                all_titles.append(title)
-            logger.info(
-                "Fetched %d played games (offset=%d, skipped_unknown=%d)",
-                len(titles),
-                offset,
-                skipped_unknown,
-            )
-            if len(titles) < page:
-                break
-            offset += page
+            self._played_games_cache = cached
+            return cached
 
+        self._cache_store(CACHE_PLAYED, all_titles)
         self._played_games_cache = all_titles
         return all_titles
 
     async def get_trophy_library_games(self) -> List[Dict[str, str]]:
-        all_titles: List[Dict[str, str]] = []
-        offset = 0
-        page = TROPHY_TITLES_PAGE_SIZE
-        index: Dict[str, Dict[str, str]] = {}
-        while True:
-            response = await self._http_client.api_get(
-                trophy_titles_url(limit=page, offset=offset)
-            )
-            batch = response.get("trophyTitles") or []
-            for title in batch:
-                np_id = title.get("npCommunicationId")
-                if not np_id:
-                    continue
-                platform = title.get("trophyTitlePlatform") or ""
-                np_service = title.get("npServiceName") or (
-                    "trophy2" if "PS5" in platform else "trophy"
+        try:
+            all_titles: List[Dict[str, str]] = []
+            offset = 0
+            page = TROPHY_TITLES_PAGE_SIZE
+            index: Dict[str, Dict[str, str]] = {}
+            while True:
+                response = await self._http_client.api_get(
+                    trophy_titles_url(limit=page, offset=offset)
                 )
-                index[np_id] = {
-                    "npCommunicationId": np_id,
-                    "npServiceName": np_service,
-                    "name": title.get("trophyTitleName") or "",
-                    "platform": platform,
-                }
-                if title.get("hiddenFlag"):
-                    continue
-                name = title.get("trophyTitleName")
-                if not name:
-                    continue
-                all_titles.append(
-                    {
-                        "titleId": np_id,
-                        "name": name,
-                        "source": "trophy",
+                batch = response.get("trophyTitles") or []
+                for title in batch:
+                    np_id = title.get("npCommunicationId")
+                    if not np_id:
+                        continue
+                    platform = title.get("trophyTitlePlatform") or ""
+                    np_service = title.get("npServiceName") or (
+                        "trophy2" if "PS5" in platform else "trophy"
+                    )
+                    index[np_id] = {
+                        "npCommunicationId": np_id,
+                        "npServiceName": np_service,
+                        "name": title.get("trophyTitleName") or "",
+                        "platform": platform,
+                        "lastUpdated": title.get("lastUpdatedDateTime") or "",
                     }
-                )
-            logger.info("Fetched %d trophy titles (offset=%d)", len(batch), offset)
-            if len(batch) < page:
-                break
-            offset += page
+                    if title.get("hiddenFlag"):
+                        continue
+                    name = title.get("trophyTitleName")
+                    if not name:
+                        continue
+                    all_titles.append(
+                        {
+                            "titleId": np_id,
+                            "name": name,
+                            "source": "trophy",
+                        }
+                    )
+                logger.info("Fetched %d trophy titles (offset=%d)", len(batch), offset)
+                if len(batch) < page:
+                    break
+                offset += page
+        except Exception:
+            cached = self._cache_load(CACHE_TROPHY_TITLES, None)
+            if cached is None:
+                raise
+            logger.warning(
+                "Trophy titles fetch failed; using %d cached entries",
+                len(cached.get("titles") or []),
+                exc_info=True,
+            )
+            self._trophy_title_index = cached.get("index") or {}
+            return cached.get("titles") or []
 
+        self._cache_store(CACHE_TROPHY_TITLES, {"titles": all_titles, "index": index})
         self._trophy_title_index = index
         return all_titles
 
@@ -375,9 +480,30 @@ class PSNClient:
     def _is_store_title_id(game_id: str) -> bool:
         return game_id.startswith(STORE_TITLE_PREFIXES)
 
+    def _trophy_cache_entries(self) -> Dict[str, dict]:
+        if self._trophy_cache is None:
+            self._trophy_cache = self._cache_load(CACHE_TROPHIES, {})
+        return self._trophy_cache
+
     async def _load_np_comm_achievements(
         self, np_comm_id: str, np_service_name: str
     ) -> List[Achievement]:
+        # Skip both API calls when Sony reports no trophy activity since the
+        # cached copy was taken (lastUpdatedDateTime is bumped on any unlock).
+        meta = self._trophy_title_index.get(np_comm_id) or {}
+        last_updated = meta.get("lastUpdated") or ""
+        cache = self._trophy_cache_entries()
+        entry = cache.get(np_comm_id)
+        if entry and last_updated and entry.get("u") == last_updated:
+            return [
+                Achievement(
+                    unlock_time=item[0],
+                    achievement_id=item[1],
+                    achievement_name=item[2],
+                )
+                for item in entry.get("a") or []
+            ]
+
         earned_response = await self._http_client.api_get(
             user_trophies_earned_url(
                 np_communication_id=np_comm_id,
@@ -390,18 +516,40 @@ class PSNClient:
                 np_service_name=np_service_name,
             )
         )
-        return merge_earned_with_definitions(
+        achievements = merge_earned_with_definitions(
             earned_response, title_response, np_comm_id
         )
+        if last_updated:
+            cache[np_comm_id] = {
+                "u": last_updated,
+                "a": [
+                    [item.unlock_time, item.achievement_id, item.achievement_name]
+                    for item in achievements
+                ],
+            }
+            self._cache_store(CACHE_TROPHIES, cache)
+        return achievements
 
     async def _resolve_store_trophy_sets(self, store_id: str) -> List[dict]:
+        # A store title's trophy-set mapping never changes once it exists, so
+        # cache hits avoid one request per game per sync.
+        if self._store_trophy_map is None:
+            self._store_trophy_map = self._cache_load(CACHE_STORE_TROPHY_MAP, {})
+        cached_sets = self._store_trophy_map.get(store_id)
+        if cached_sets:
+            return cached_sets
+
         response = await self._http_client.api_get(
             user_trophies_for_titles_url(np_title_ids=store_id),
             not_found_ok=True,
         )
         if not response:
             return []
-        return extract_store_title_mappings(response).get(store_id, [])
+        trophy_sets = extract_store_title_mappings(response).get(store_id, [])
+        if trophy_sets:
+            self._store_trophy_map[store_id] = trophy_sets
+            self._cache_store(CACHE_STORE_TROPHY_MAP, self._store_trophy_map)
+        return trophy_sets
 
     async def _fetch_achievements_for_title(self, game_id: str) -> List[Achievement]:
         if self._is_store_title_id(game_id):

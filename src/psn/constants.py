@@ -56,8 +56,9 @@ PLAYED_GAMES_PAGE_SIZE = 200
 TROPHY_TITLES_PAGE_SIZE = 800
 TROPHY_BATCH_SIZE = 5
 # Below galaxy.http's connector limit (20) so queued requests don't
-# exhaust the 30s total timeout while waiting for a connection.
-TROPHY_FETCH_CONCURRENCY = 10
+# exhaust the 30s total timeout while waiting for a connection; kept low
+# because the HttpClient rate limiter paces requests globally anyway.
+TROPHY_FETCH_CONCURRENCY = 4
 FRIENDS_PAGE_SIZE = 2000
 
 USER_GAMES_API_BASE = "https://m.np.playstation.com/api/gamelist/v2/users"

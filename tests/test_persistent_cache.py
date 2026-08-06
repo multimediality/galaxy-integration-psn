@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -7,13 +8,19 @@ from psn.client import (
     CACHE_TROPHY_TITLES,
     PSNClient,
 )
+from psn.graphql import purchased_games_url
 from psn.rest_urls import (
     played_games_url as rest_played_games_url,
     title_trophies_url,
     trophy_titles_url,
     user_trophies_earned_url,
+    user_trophies_for_titles_url,
 )
-from psn.constants import PLAYED_GAMES_PAGE_SIZE, TROPHY_TITLES_PAGE_SIZE
+from psn.constants import (
+    DEFAULT_PAGE_SIZE,
+    PLAYED_GAMES_PAGE_SIZE,
+    TROPHY_TITLES_PAGE_SIZE,
+)
 
 NP_COMM_ID = "NPWR11111_00"
 EARNED_URL = user_trophies_earned_url(
@@ -33,6 +40,8 @@ class FakeHttpClient:
         if isinstance(result, Exception):
             raise result
         return result
+
+    graphql_get = api_get
 
 
 def make_cached_client(http_client, cache=None):
@@ -153,3 +162,101 @@ async def test_played_games_raise_without_cache():
 
     with pytest.raises(RuntimeError):
         await client.get_played_games()
+
+
+@pytest.mark.asyncio
+async def test_purchased_games_memoized_within_session():
+    url = purchased_games_url(start=0, size=DEFAULT_PAGE_SIZE)
+    response = {
+        "data": {
+            "purchasedTitlesRetrieve": {
+                "games": [{"titleId": "CUSA00001_00", "name": "Game"}]
+            }
+        }
+    }
+    http_client = FakeHttpClient({url: response})
+    client, _ = make_cached_client(http_client)
+
+    first = await client.get_purchased_games()
+    second = await client.get_purchased_games()
+
+    assert first is second
+    assert len(http_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_trophy_titles_memoized_within_session():
+    url = trophy_titles_url(limit=TROPHY_TITLES_PAGE_SIZE, offset=0)
+    response = {
+        "trophyTitles": [
+            {
+                "npCommunicationId": NP_COMM_ID,
+                "trophyTitleName": "PS3 Classic",
+                "trophyTitlePlatform": "PS3",
+            }
+        ]
+    }
+    http_client = FakeHttpClient({url: response})
+    client, _ = make_cached_client(http_client)
+
+    await client.get_trophy_library_games()
+    await client.get_trophy_library_games()
+
+    assert len(http_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_trophy_mapping_negative_cached():
+    store_id = "CUSA99999_00"
+    url = user_trophies_for_titles_url(np_title_ids=store_id)
+    http_client = FakeHttpClient(
+        {url: {"titles": [{"npTitleId": store_id, "trophyTitles": []}]}}
+    )
+    client, cache = make_cached_client(http_client)
+
+    assert await client._resolve_store_trophy_sets(store_id) == []
+    assert await client._resolve_store_trophy_sets(store_id) == []
+    assert len(http_client.calls) == 1  # second lookup served by negative cache
+
+    # After the negative entry expires the mapping is re-checked.
+    client._store_trophy_map[store_id] = {
+        "neg": time.time() - 1
+    }
+    assert await client._resolve_store_trophy_sets(store_id) == []
+    assert len(http_client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_store_trophy_mapping_positive_cached_permanently():
+    store_id = "PPSA11111_00"
+    url = user_trophies_for_titles_url(np_title_ids=store_id)
+    trophy_sets = [{"npCommunicationId": NP_COMM_ID, "npServiceName": "trophy2"}]
+    http_client = FakeHttpClient(
+        {
+            url: {
+                "titles": [
+                    {
+                        "npTitleId": store_id,
+                        "trophyTitles": [
+                            {
+                                "npCommunicationId": NP_COMM_ID,
+                                "npServiceName": "trophy2",
+                                "trophyTitlePlatform": "PS5",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    client, cache = make_cached_client(http_client)
+
+    assert await client._resolve_store_trophy_sets(store_id) == trophy_sets
+    assert await client._resolve_store_trophy_sets(store_id) == trophy_sets
+    assert len(http_client.calls) == 1
+
+    # Survives a plugin restart via the persistent cache.
+    fresh_http = FakeHttpClient({})
+    restarted, _ = make_cached_client(fresh_http, cache)
+    assert await restarted._resolve_store_trophy_sets(store_id) == trophy_sets
+    assert fresh_http.calls == []

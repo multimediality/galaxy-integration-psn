@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -21,8 +22,10 @@ from psn.constants import (
     ACCOUNT_ME_URL,
     DEFAULT_PAGE_SIZE,
     FRIENDS_PAGE_SIZE,
+    LIBRARY_SOURCE_MEMO_TTL,
     PLAYED_GAMES_PAGE_SIZE,
     PSN_PLUS_SUBSCRIPTIONS_URL,
+    STORE_TROPHY_NEGATIVE_TTL,
     TROPHY_FETCH_CONCURRENCY,
     TROPHY_TITLES_PAGE_SIZE,
 )
@@ -103,7 +106,9 @@ class PSNClient:
         self._push_cache: Optional[Callable[[], None]] = None
         self._cache_dirty = False
         self._trophy_cache: Optional[Dict[str, dict]] = None
-        self._store_trophy_map: Optional[Dict[str, List[dict]]] = None
+        self._store_trophy_map: Optional[Dict[str, Any]] = None
+        self._purchased_memo: Optional[Tuple[float, List[Dict[str, str]]]] = None
+        self._trophy_titles_memo: Optional[Tuple[float, List[Dict[str, str]]]] = None
 
     def attach_persistent_cache(
         self, getter: Callable[[], dict], pusher: Callable[[], None]
@@ -205,6 +210,11 @@ class PSNClient:
             raise UnknownBackendResponse(str(exc)) from exc
 
     async def get_purchased_games(self) -> List[Dict[str, str]]:
+        if self._purchased_memo is not None:
+            fetched_at, games = self._purchased_memo
+            if time.monotonic() - fetched_at < LIBRARY_SOURCE_MEMO_TTL:
+                return games
+
         try:
             all_games: List[Dict[str, str]] = []
             start = 0
@@ -230,6 +240,7 @@ class PSNClient:
             )
             return cached
         self._cache_store(CACHE_PURCHASED, all_games)
+        self._purchased_memo = (time.monotonic(), all_games)
         return all_games
 
     async def get_played_games_graphql(self) -> List[Dict[str, str]]:
@@ -316,6 +327,11 @@ class PSNClient:
         return all_titles
 
     async def get_trophy_library_games(self) -> List[Dict[str, str]]:
+        if self._trophy_titles_memo is not None:
+            fetched_at, titles = self._trophy_titles_memo
+            if time.monotonic() - fetched_at < LIBRARY_SOURCE_MEMO_TTL:
+                return titles
+
         try:
             all_titles: List[Dict[str, str]] = []
             offset = 0
@@ -371,6 +387,7 @@ class PSNClient:
 
         self._cache_store(CACHE_TROPHY_TITLES, {"titles": all_titles, "index": index})
         self._trophy_title_index = index
+        self._trophy_titles_memo = (time.monotonic(), all_titles)
         return all_titles
 
     async def get_all_library_titles(self) -> List[Dict[str, str]]:
@@ -532,23 +549,36 @@ class PSNClient:
 
     async def _resolve_store_trophy_sets(self, store_id: str) -> List[dict]:
         # A store title's trophy-set mapping never changes once it exists, so
-        # cache hits avoid one request per game per sync.
+        # positive hits are cached forever; games with no trophy activity are
+        # negative-cached with an expiry so they don't cost one request per
+        # game on every sync.
         if self._store_trophy_map is None:
             self._store_trophy_map = self._cache_load(CACHE_STORE_TROPHY_MAP, {})
-        cached_sets = self._store_trophy_map.get(store_id)
-        if cached_sets:
-            return cached_sets
+        entry = self._store_trophy_map.get(store_id)
+        if isinstance(entry, list):  # legacy positive entry
+            return entry
+        if isinstance(entry, dict):
+            if entry.get("sets"):
+                return entry["sets"]
+            if entry.get("neg", 0) > time.time():
+                return []
 
         response = await self._http_client.api_get(
             user_trophies_for_titles_url(np_title_ids=store_id),
             not_found_ok=True,
         )
-        if not response:
-            return []
-        trophy_sets = extract_store_title_mappings(response).get(store_id, [])
+        trophy_sets = (
+            extract_store_title_mappings(response).get(store_id, [])
+            if response
+            else []
+        )
         if trophy_sets:
-            self._store_trophy_map[store_id] = trophy_sets
-            self._cache_store(CACHE_STORE_TROPHY_MAP, self._store_trophy_map)
+            self._store_trophy_map[store_id] = {"sets": trophy_sets}
+        else:
+            self._store_trophy_map[store_id] = {
+                "neg": time.time() + STORE_TROPHY_NEGATIVE_TTL
+            }
+        self._cache_store(CACHE_STORE_TROPHY_MAP, self._store_trophy_map)
         return trophy_sets
 
     async def _fetch_achievements_for_title(self, game_id: str) -> List[Achievement]:

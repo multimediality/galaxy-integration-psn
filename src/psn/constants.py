@@ -61,6 +61,13 @@ TROPHY_BATCH_SIZE = 5
 TROPHY_FETCH_CONCURRENCY = 4
 FRIENDS_PAGE_SIZE = 2000
 
+# Galaxy can request the owned-games import several times in quick succession
+# after a reconnect; reuse in-session source fetches for this many seconds.
+LIBRARY_SOURCE_MEMO_TTL = 300.0
+# Store titles with no trophy activity re-check their trophy-set mapping at
+# most this often (seconds); a first unlock bumps lastUpdatedDateTime anyway.
+STORE_TROPHY_NEGATIVE_TTL = 7 * 24 * 3600.0
+
 USER_GAMES_API_BASE = "https://m.np.playstation.com/api/gamelist/v2/users"
 TROPHY_API_BASE = "https://m.np.playstation.com/api/trophy"
 USER_PROFILE_API_BASE = (

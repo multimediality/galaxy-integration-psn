@@ -69,6 +69,10 @@ LIBRARY_SOURCE_MEMO_TTL = 300.0
 STORE_TROPHY_NEGATIVE_TTL = 7 * 24 * 3600.0
 # The trophyTitles-for-titles endpoint accepts at most 5 npTitleIds per call.
 STORE_TROPHY_BATCH_SIZE = 5
+# Push fresh game times / trophies to Galaxy this often (seconds). Each poll
+# costs ~2 requests (played list + trophy titles list) plus per-game fetches
+# only for titles Sony reports as changed.
+AUTO_UPDATE_INTERVAL = 600.0
 
 USER_GAMES_API_BASE = "https://m.np.playstation.com/api/gamelist/v2/users"
 TROPHY_API_BASE = "https://m.np.playstation.com/api/trophy"

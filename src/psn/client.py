@@ -277,8 +277,8 @@ class PSNClient:
             },
         }
 
-    async def get_played_games(self) -> List[Dict[str, Any]]:
-        if self._played_games_cache is not None:
+    async def get_played_games(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        if not refresh and self._played_games_cache is not None:
             return self._played_games_cache
 
         try:
@@ -311,6 +311,9 @@ class PSNClient:
                     break
                 offset += page
         except Exception:
+            if refresh and self._played_games_cache is not None:
+                logger.warning("Played games refresh failed; keeping snapshot", exc_info=True)
+                return self._played_games_cache
             cached = self._cache_load(CACHE_PLAYED, None)
             if cached is None:
                 raise
@@ -326,8 +329,8 @@ class PSNClient:
         self._played_games_cache = all_titles
         return all_titles
 
-    async def get_trophy_library_games(self) -> List[Dict[str, str]]:
-        if self._trophy_titles_memo is not None:
+    async def get_trophy_library_games(self, refresh: bool = False) -> List[Dict[str, str]]:
+        if not refresh and self._trophy_titles_memo is not None:
             fetched_at, titles = self._trophy_titles_memo
             if time.monotonic() - fetched_at < LIBRARY_SOURCE_MEMO_TTL:
                 return titles
@@ -530,6 +533,86 @@ class PSNClient:
     @staticmethod
     def _is_store_title_id(game_id: str) -> bool:
         return game_id.startswith(STORE_TITLE_PREFIXES)
+
+    async def detect_game_time_updates(self) -> List[GameTime]:
+        """Refresh the played list and return GameTime for changed titles."""
+        previous = self._played_games_cache
+        titles = await self.get_played_games(refresh=True)
+        if previous is None:
+            return []
+        snapshot = {
+            title.get("titleId"): (
+                title.get("playDuration"),
+                title.get("lastPlayedDateTime"),
+            )
+            for title in previous
+        }
+        updates = []
+        for title in titles:
+            title_id = title.get("titleId")
+            current = (title.get("playDuration"), title.get("lastPlayedDateTime"))
+            if title_id and snapshot.get(title_id) != current:
+                updates.append(
+                    GameTime(
+                        game_id=title_id,
+                        time_played=parse_play_duration(current[0]),
+                        last_played_time=parse_iso_datetime(current[1]),
+                    )
+                )
+        return updates
+
+    def exported_ids_for_np_comm(self, np_comm_id: str) -> List[str]:
+        """Owned store titles (or the trophy-only id) a trophy set belongs to."""
+        ids = []
+        for store_id, mapping in (self._store_trophy_map or {}).items():
+            trophy_sets = (
+                mapping if isinstance(mapping, list) else mapping.get("sets") or []
+            )
+            if any(
+                trophy_set.get("npCommunicationId") == np_comm_id
+                for trophy_set in trophy_sets
+            ):
+                ids.append(store_id)
+        if not ids and np_comm_id in self._trophy_title_index:
+            ids.append(np_comm_id)
+        return ids
+
+    async def detect_trophy_updates(self) -> List[Tuple[str, Achievement]]:
+        """Refresh trophy titles and return newly earned achievements."""
+        previous_index = dict(self._trophy_title_index) if self._trophy_title_index else None
+        await self.get_trophy_library_games(refresh=True)
+        if previous_index is None:
+            return []
+
+        cache = self._trophy_cache_entries()
+        updates: List[Tuple[str, Achievement]] = []
+        for np_comm_id, meta in self._trophy_title_index.items():
+            before = (previous_index.get(np_comm_id) or {}).get("lastUpdated")
+            if before is None or meta.get("lastUpdated") == before:
+                continue
+            known_ids = {
+                item[1] for item in (cache.get(np_comm_id) or {}).get("a") or []
+            }
+            try:
+                achievements = await self._load_np_comm_achievements(
+                    np_comm_id, meta.get("npServiceName") or "trophy"
+                )
+            except Exception:
+                logger.warning(
+                    "Could not refresh trophies for %s", np_comm_id, exc_info=True
+                )
+                continue
+            fresh = [
+                achievement
+                for achievement in achievements
+                if achievement.achievement_id not in known_ids
+            ]
+            if not fresh:
+                continue
+            for game_id in self.exported_ids_for_np_comm(np_comm_id):
+                for achievement in fresh:
+                    updates.append((game_id, achievement))
+        return updates
 
     def _trophy_cache_entries(self) -> Dict[str, dict]:
         if self._trophy_cache is None:

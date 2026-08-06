@@ -25,6 +25,7 @@ from psn.constants import (
     LIBRARY_SOURCE_MEMO_TTL,
     PLAYED_GAMES_PAGE_SIZE,
     PSN_PLUS_SUBSCRIPTIONS_URL,
+    STORE_TROPHY_BATCH_SIZE,
     STORE_TROPHY_NEGATIVE_TTL,
     TROPHY_FETCH_CONCURRENCY,
     TROPHY_TITLES_PAGE_SIZE,
@@ -424,11 +425,20 @@ class PSNClient:
         ]
         self._concept_siblings = build_concept_siblings(played_games)
 
-        # Trophy sets already represented by a store SKU (known from the
-        # store-title mapping built during trophy imports) must not create a
-        # second entry for the same game.
-        if self._store_trophy_map is None:
-            self._store_trophy_map = self._cache_load(CACHE_STORE_TROPHY_MAP, {})
+        # Trophy sets belonging to an owned store SKU must not create a
+        # second library entry: collections like Spyro Reignited Trilogy
+        # carry several differently-named trophy sets under one store title,
+        # so exclusion has to work by id. Resolve mappings for all owned
+        # store titles up front (batched, cached permanently).
+        store_ids = sorted(
+            {
+                entry["titleId"]
+                for entry in purchased_games + played_entries
+                if entry.get("titleId", "").startswith(STORE_TITLE_PREFIXES)
+            }
+        )
+        await self._ensure_store_trophy_mappings(store_ids)
+
         mapped_np_comm_ids = set()
         for mapping in self._store_trophy_map.values():
             trophy_sets = (
@@ -570,6 +580,55 @@ class PSNClient:
             }
             self._cache_store(CACHE_TROPHIES, cache)
         return achievements
+
+    async def _ensure_store_trophy_mappings(self, store_ids: List[str]) -> None:
+        """Batch-resolve store-title -> trophy-set mappings for owned games."""
+        if self._store_trophy_map is None:
+            self._store_trophy_map = self._cache_load(CACHE_STORE_TROPHY_MAP, {})
+        now = time.time()
+        unknown = []
+        for store_id in store_ids:
+            entry = self._store_trophy_map.get(store_id)
+            if isinstance(entry, list):
+                continue
+            if isinstance(entry, dict) and (
+                entry.get("sets") or entry.get("neg", 0) > now
+            ):
+                continue
+            unknown.append(store_id)
+        if not unknown:
+            return
+
+        logger.info(
+            "Resolving trophy-set mappings for %d store titles", len(unknown)
+        )
+        try:
+            for start in range(0, len(unknown), STORE_TROPHY_BATCH_SIZE):
+                batch = unknown[start : start + STORE_TROPHY_BATCH_SIZE]
+                response = await self._http_client.api_get(
+                    user_trophies_for_titles_url(np_title_ids=",".join(batch)),
+                    not_found_ok=True,
+                )
+                mappings = (
+                    extract_store_title_mappings(response) if response else {}
+                )
+                for store_id in batch:
+                    trophy_sets = mappings.get(store_id) or []
+                    if trophy_sets:
+                        self._store_trophy_map[store_id] = {"sets": trophy_sets}
+                    else:
+                        self._store_trophy_map[store_id] = {
+                            "neg": now + STORE_TROPHY_NEGATIVE_TTL
+                        }
+        except Exception:
+            # Partial mappings are still useful; the name guard covers the rest.
+            logger.warning(
+                "Trophy-set mapping resolution interrupted; continuing with "
+                "%d mappings",
+                len(self._store_trophy_map),
+                exc_info=True,
+            )
+        self._cache_store(CACHE_STORE_TROPHY_MAP, self._store_trophy_map)
 
     async def _resolve_store_trophy_sets(self, store_id: str) -> List[dict]:
         # A store title's trophy-set mapping never changes once it exists, so

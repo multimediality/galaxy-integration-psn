@@ -67,6 +67,8 @@ LIBRARY_SOURCE_MEMO_TTL = 300.0
 # Store titles with no trophy activity re-check their trophy-set mapping at
 # most this often (seconds); a first unlock bumps lastUpdatedDateTime anyway.
 STORE_TROPHY_NEGATIVE_TTL = 7 * 24 * 3600.0
+# The trophyTitles-for-titles endpoint accepts at most 5 npTitleIds per call.
+STORE_TROPHY_BATCH_SIZE = 5
 
 USER_GAMES_API_BASE = "https://m.np.playstation.com/api/gamelist/v2/users"
 TROPHY_API_BASE = "https://m.np.playstation.com/api/trophy"

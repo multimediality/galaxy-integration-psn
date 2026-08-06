@@ -3,6 +3,16 @@ import pytest
 from psn.client import PSNClient
 from psn.duration import parse_play_duration
 from psn.library_utils import merge_library_entries, pick_display_name
+from psn.rest_urls import user_trophies_for_titles_url
+
+FAR_FUTURE = 4_000_000_000_000.0
+
+
+def preset_no_mappings(client, store_ids, extra=None):
+    """Mark store ids as having no trophy sets so no resolution requests fire."""
+    mapping = {store_id: {"neg": FAR_FUTURE} for store_id in store_ids}
+    mapping.update(extra or {})
+    client._store_trophy_map = mapping
 
 
 class StubPSNClient(PSNClient):
@@ -44,7 +54,7 @@ class StubPSNClient(PSNClient):
 @pytest.mark.asyncio
 async def test_get_all_library_titles_merges_and_dedupes():
     client = StubPSNClient()
-    client._store_trophy_map = {}
+    preset_no_mappings(client, ["CUSA12345_00", "CUSA67890_00", "CUSA11111_00"])
     client._trophy_title_index = {
         "NPWR01234_00": {
             "npCommunicationId": "NPWR01234_00",
@@ -101,7 +111,10 @@ async def test_get_all_library_titles_emits_exactly_owned_ids():
     # merging (Sony concepts group soundtracks with the game): every owned
     # id is emitted as-is; GOG's backend stacks same-game releases itself.
     client = MultiRegionStubClient()
-    client._store_trophy_map = {}
+    preset_no_mappings(
+        client,
+        [f"CUSA{10000 + i:05d}_00" for i in range(3)] + ["PPSA55555_00"],
+    )
     client._trophy_title_index = {}
     titles = await client.get_all_library_titles()
 
@@ -156,7 +169,9 @@ class KnackStubClient(PSNClient):
 @pytest.mark.asyncio
 async def test_soundtrack_sharing_concept_never_swallows_the_game():
     client = KnackStubClient()
-    client._store_trophy_map = {}
+    preset_no_mappings(
+        client, ["CUSA00006_00", "CUSA07670_00", "CUSA09758_00"]
+    )
     client._trophy_title_index = {}
     titles = await client.get_all_library_titles()
     by_id = {title["titleId"]: title["name"] for title in titles}
@@ -164,6 +179,78 @@ async def test_soundtrack_sharing_concept_never_swallows_the_game():
     assert set(by_id) == {"CUSA00006_00", "CUSA07670_00", "CUSA09758_00"}
     assert by_id["CUSA07670_00"] in ("KNACK2", "KNACK 2")
     assert "Саундтрек" not in by_id["CUSA07670_00"]
+
+
+class FakeHttp:
+    def __init__(self, responses):
+        self._responses = responses
+        self.calls = []
+
+    async def api_get(self, url, **kwargs):
+        self.calls.append(url)
+        return self._responses[url]
+
+
+class SpyroStubClient(PSNClient):
+    """One purchased collection whose three trophy sets have their own names."""
+
+    def __init__(self):
+        pass
+
+    async def get_purchased_games(self):
+        return [
+            {
+                "titleId": "CUSA12085_00",
+                "name": "Spyro Reignited Trilogy",
+                "source": "purchased",
+            }
+        ]
+
+    async def get_played_games(self):
+        return []
+
+    async def get_trophy_library_games(self):
+        return [
+            {"titleId": "NPWR15579_00", "name": "Spyro the Dragon", "source": "trophy"},
+            {"titleId": "NPWR15891_00", "name": "Spyro 2: Ripto's Rage!", "source": "trophy"},
+            {"titleId": "NPWR15892_00", "name": "Spyro 3: Year of the Dragon", "source": "trophy"},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_collection_trophy_sets_never_become_library_entries():
+    # rc3 tester regression: on a fresh connect (empty mapping cache) the
+    # Spyro trilogy's three trophy sets appeared as three extra games.
+    mapping_url = user_trophies_for_titles_url(np_title_ids="CUSA12085_00")
+    client = SpyroStubClient()
+    client._http_client = FakeHttp(
+        {
+            mapping_url: {
+                "titles": [
+                    {
+                        "npTitleId": "CUSA12085_00",
+                        "trophyTitles": [
+                            {"npCommunicationId": "NPWR15579_00", "npServiceName": "trophy"},
+                            {"npCommunicationId": "NPWR15891_00", "npServiceName": "trophy"},
+                            {"npCommunicationId": "NPWR15892_00", "npServiceName": "trophy"},
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    client._store_trophy_map = None  # fresh connect: nothing cached
+    client._persistent_cache = None
+    client._trophy_title_index = {
+        "NPWR15579_00": {"platform": "PS4"},
+        "NPWR15891_00": {"platform": "PS4"},
+        "NPWR15892_00": {"platform": "PS4"},
+    }
+
+    titles = await client.get_all_library_titles()
+
+    assert [title["titleId"] for title in titles] == ["CUSA12085_00"]
+    assert client._http_client.calls == [mapping_url]
 
 
 def test_pick_display_name_prefers_localized():
@@ -207,9 +294,11 @@ async def test_ps4_trophy_only_games_kept_unless_already_represented():
         "NPWR23456_00": {"platform": "PS4,PS5"},
         "NPWR34567_00": {"platform": "PS5"},
     }
-    client._store_trophy_map = {
-        "CUSA88888_00": {"sets": [{"npCommunicationId": "NPWR34567_00"}]}
-    }
+    preset_no_mappings(
+        client,
+        ["CUSA99999_00"],
+        extra={"CUSA88888_00": {"sets": [{"npCommunicationId": "NPWR34567_00"}]}},
+    )
     titles = await client.get_all_library_titles()
     title_ids = {title["titleId"] for title in titles}
 

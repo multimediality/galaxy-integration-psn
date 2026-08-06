@@ -32,7 +32,6 @@ from psn.library_utils import (
     build_concept_siblings,
     dedupe_library_by_concept,
     enrich_purchased_concept_ids,
-    expand_concept_sibling_skus,
     merge_library_entries,
     parse_iso_datetime,
     pick_display_name,
@@ -318,15 +317,16 @@ class PSNClient:
             trophy_only.append(game)
 
         merged = merge_library_entries(purchased_games + played_entries + trophy_only)
-        deduped = dedupe_library_by_concept(merged)
-        library = expand_concept_sibling_skus(deduped, self._concept_siblings)
+        # One library row per concept: Galaxy 2.1 shows every game_id as a
+        # separate library entry, so emitting sibling SKUs duplicates games
+        # (issue #48). Siblings are still used to alias play time and trophy
+        # contexts across regional SKUs.
+        library = dedupe_library_by_concept(merged)
         logger.info(
-            "Total library titles: %d (merged=%d, deduped=%d, with sibling SKUs=%d, "
-            "purchased=%d, played=%d, trophy-only=%d)",
+            "Total library titles: %d (merged=%d, purchased=%d, played=%d, "
+            "trophy-only=%d)",
             len(library),
             len(merged),
-            len(deduped),
-            len(library),
             len(purchased_games),
             len(played_entries),
             len(trophy_only),

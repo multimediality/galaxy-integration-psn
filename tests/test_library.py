@@ -66,6 +66,46 @@ async def test_get_all_library_titles_merges_and_dedupes():
     assert merged["CUSA67890_00"] == "Test Game Two (Played)"
 
 
+class MultiRegionStubClient(PSNClient):
+    """One game owned as many regional SKUs plus its PS5 version (issue #48)."""
+
+    def __init__(self):
+        pass
+
+    async def get_purchased_games(self):
+        return [
+            {"titleId": f"CUSA{10000 + i:05d}_00", "name": "Final Fantasy XV", "source": "purchased"}
+            for i in range(16)
+        ]
+
+    async def get_played_games(self):
+        concept_ids = [f"CUSA{10000 + i:05d}_00" for i in range(16)] + ["PPSA55555_00"]
+        return [
+            {
+                "titleId": "PPSA55555_00",
+                "name": "Final Fantasy XV",
+                "localizedName": "Final Fantasy XV",
+                "concept": {"id": 777, "name": "Final Fantasy XV", "titleIds": concept_ids},
+                "source": "played",
+            }
+        ]
+
+    async def get_trophy_library_games(self):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_get_all_library_titles_emits_one_entry_per_concept():
+    client = MultiRegionStubClient()
+    client._trophy_title_index = {}
+    titles = await client.get_all_library_titles()
+
+    assert len(titles) == 1
+    assert titles[0]["name"] == "Final Fantasy XV"
+    # Siblings are still tracked for play-time/trophy aliasing.
+    assert "CUSA10000_00" in client._concept_siblings
+
+
 def test_pick_display_name_prefers_localized():
     assert pick_display_name("Short", "Longer Localized Name") == "Longer Localized Name"
 

@@ -3,7 +3,6 @@ from psn.library_utils import (
     build_concept_siblings,
     dedupe_library_by_concept,
     enrich_purchased_concept_ids,
-    expand_concept_sibling_skus,
 )
 
 
@@ -29,33 +28,17 @@ def test_dedupe_library_by_concept_prefers_ppsa():
     assert deduped[0]["titleId"] == "PPSA10609_00"
 
 
-def test_expand_concept_sibling_skus():
-    entries = [{"titleId": "PPSA09955_00", "name": "Bluey", "conceptId": "999"}]
-    siblings = {"PPSA09955_00": ["CUSA36463_00"], "CUSA36463_00": ["PPSA09955_00"]}
-    expanded = expand_concept_sibling_skus(entries, siblings)
-    assert {entry["titleId"] for entry in expanded} == {
-        "PPSA09955_00",
-        "CUSA36463_00",
-    }
-
-
-def test_expand_concept_sibling_skus_appends_siblings_after_real_entries():
-    # Galaxy ingests release keys in order, so real library entries must all
-    # come before any expanded sibling SKUs.
+def test_dedupe_library_by_concept_collapses_regional_skus():
+    # Issue #48: a game owned in many regions (16 SKUs for FF XV) must
+    # produce exactly one library entry, since Galaxy 2.1 shows every
+    # game_id as a separate game.
     entries = [
-        {"titleId": "PPSA00001_00", "name": "Game A", "conceptId": "1"},
-        {"titleId": "PPSA00002_00", "name": "Game B", "conceptId": "2"},
+        {"titleId": f"CUSA{10000 + i:05d}_00", "name": "Final Fantasy XV", "conceptId": 777}
+        for i in range(16)
     ]
-    siblings = {
-        "PPSA00001_00": ["CUSA00001_00"],
-        "PPSA00002_00": ["CUSA00002_00"],
-    }
-    expanded = expand_concept_sibling_skus(entries, siblings)
-    assert [entry["titleId"] for entry in expanded[:2]] == [
-        "PPSA00001_00",
-        "PPSA00002_00",
-    ]
-    assert len(expanded) == 4
+    deduped = dedupe_library_by_concept(entries)
+    assert len(deduped) == 1
+    assert deduped[0]["name"] == "Final Fantasy XV"
 
 
 def test_enrich_purchased_concept_ids():

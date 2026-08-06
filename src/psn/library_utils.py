@@ -147,40 +147,6 @@ def _canonical_score(entry: Dict[str, str]) -> int:
     return score
 
 
-STORE_SKU_PREFIXES = ("CUSA", "PPSA", "PCSE", "PCSA")
-
-
-def expand_concept_sibling_skus(
-    entries: List[Dict[str, str]],
-    siblings: Dict[str, List[str]],
-) -> List[Dict[str, str]]:
-    """Re-add CUSA/PPSA sibling SKUs so Galaxy can match GOG catalog IDs.
-
-    Real library entries always come first; sibling SKUs are appended after
-    them so Galaxy's ordered backend ingestion processes real games before
-    the redundant matching SKUs.
-    """
-    known = {entry["titleId"] for entry in entries if entry.get("titleId")}
-    expanded = list(entries)
-    for entry in entries:
-        title_id = entry.get("titleId")
-        if not title_id:
-            continue
-        for sibling_id in siblings.get(title_id, []):
-            if sibling_id in known or not sibling_id.startswith(STORE_SKU_PREFIXES):
-                continue
-            expanded.append(
-                {
-                    "titleId": sibling_id,
-                    "name": entry.get("name") or "",
-                    "conceptId": entry.get("conceptId"),
-                    "source": entry.get("source"),
-                }
-            )
-            known.add(sibling_id)
-    return expanded
-
-
 def dedupe_library_by_concept(entries: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Keep one library row per PSN concept to avoid duplicate CUSA/PPSA pairs."""
     by_concept: Dict[str, List[Dict[str, str]]] = {}

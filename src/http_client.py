@@ -86,6 +86,11 @@ class HttpClient:
             raise_for_status=False,
         )
         self._rate_limiter = RateLimiter(API_RATE_LIMIT_INTERVAL)
+        self._token_refresher = None
+
+    def set_token_refresher(self, refresher):
+        """Async callback returning True when a fresh access token was set."""
+        self._token_refresher = refresher
 
     async def close(self):
         await self._session.close()
@@ -109,8 +114,9 @@ class HttpClient:
         if not self._access_token:
             raise AuthenticationRequired("PlayStation access token is missing")
 
-        headers = {**GRAPHQL_HEADERS, **self._auth_headers()}
+        refresh_attempted = False
         for attempt in range(API_MAX_RETRIES + 1):
+            headers = {**GRAPHQL_HEADERS, **self._auth_headers()}
             await self._rate_limiter.wait()
             try:
                 with handle_exception():
@@ -129,6 +135,23 @@ class HttpClient:
             if response.status == 404 and not_found_ok:
                 logger.debug("%s not found (404): %s", label, url)
                 return None
+            if (
+                response.status == 401
+                and self._token_refresher is not None
+                and not refresh_attempted
+                and attempt < API_MAX_RETRIES
+            ):
+                # Sony access tokens expire after ~an hour; refresh once and
+                # retry so long-running sessions don't lose data mid-sync.
+                refresh_attempted = True
+                logger.info("%s got 401; refreshing access token", label)
+                try:
+                    refreshed = await self._token_refresher()
+                except Exception:
+                    logger.warning("Access token refresh failed", exc_info=True)
+                    refreshed = False
+                if refreshed:
+                    continue
             if response.status in RETRYABLE_STATUSES and attempt < API_MAX_RETRIES:
                 delay = _retry_delay(response, attempt)
                 logger.warning(

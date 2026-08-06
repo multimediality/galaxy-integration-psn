@@ -101,3 +101,53 @@ async def test_404_with_not_found_ok_returns_none_without_retry(monkeypatch):
     client = make_client(monkeypatch, [FakeResponse(404)])
     assert await client.api_get(API_URL, not_found_ok=True) is None
     assert client._api_session.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_401_refreshes_token_and_retries(monkeypatch):
+    client = make_client(
+        monkeypatch, [FakeResponse(401), FakeResponse(200, '{"ok": true}')]
+    )
+    refreshes = []
+
+    async def refresher():
+        refreshes.append(1)
+        client._access_token = "fresh-token"
+        return True
+
+    client.set_token_refresher(refresher)
+
+    assert await client.api_get(API_URL) == {"ok": True}
+    assert len(refreshes) == 1
+    assert client._api_session.requests == 2
+
+
+@pytest.mark.asyncio
+async def test_401_raises_when_refresh_fails(monkeypatch):
+    client = make_client(monkeypatch, [FakeResponse(401)])
+
+    async def refresher():
+        return False
+
+    client.set_token_refresher(refresher)
+
+    with pytest.raises(AccessDenied):
+        await client.api_get(API_URL)
+    assert client._api_session.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_401_refresh_only_attempted_once(monkeypatch):
+    client = make_client(monkeypatch, [FakeResponse(401), FakeResponse(401)])
+    refreshes = []
+
+    async def refresher():
+        refreshes.append(1)
+        return True
+
+    client.set_token_refresher(refresher)
+
+    with pytest.raises(AccessDenied):
+        await client.api_get(API_URL)
+    assert len(refreshes) == 1
+    assert client._api_session.requests == 2

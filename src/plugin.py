@@ -42,6 +42,9 @@ class PSNPlugin(Plugin):
             self._psn_client,
             self.store_credentials,
         )
+        self._http_client.set_token_refresher(
+            self._authenticator.refresh_access_token
+        )
         self._owned_games_import: asyncio.Event | None = None
         self._psn_client.attach_persistent_cache(
             lambda: self.persistent_cache, self.push_cache

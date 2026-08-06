@@ -1,6 +1,9 @@
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 VALID_TITLE_ID = re.compile(
     r"^(CUSA|PPSA|PCSE|PCSA|NPWR|NPUA|NPUZ|NPHB|NPHG|NPHX|NPEA|NPEB|NPEZ|NPUF|NPUJ|NPUK|NPUH|NPUC|NPUV|NPUW|NPUY|NPUQ|NPUB|NPUG|NPUX|NPUZ)\d{5}_\d{2}$"
@@ -15,6 +18,21 @@ GENERIC_NAMES = frozenset(
         "title",
     }
 )
+
+# Names marking a non-game product (soundtrack bundles, demos, themes) that
+# shares a concept with the real game and must never represent it.
+JUNK_NAME_RE = re.compile(
+    r"soundtrack|\bost\b|\bdemo\b|\btrial\b|\btheme\b|\bavatar\b|\bbeta\b",
+    re.IGNORECASE,
+)
+
+
+def is_junk_name(name: Optional[str]) -> bool:
+    return bool(name and JUNK_NAME_RE.search(name))
+
+
+def normalize_title(name: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", (name or "").lower()).strip()
 
 
 def is_valid_title_id(title_id: str) -> bool:
@@ -31,6 +49,9 @@ def pick_display_name(*candidates: Optional[str]) -> str:
         if name.lower() in GENERIC_NAMES:
             continue
         score = len(name)
+        # A clean name always beats a junk one ("KNACK 2 + soundtrack").
+        if is_junk_name(name):
+            score -= 10_000
         if score > best_score:
             best = name
             best_score = score
@@ -78,35 +99,6 @@ def merge_library_entries(entries: List[Dict[str, str]]) -> List[Dict[str, str]]
     return list(merged.values())
 
 
-def enrich_purchased_concept_ids(
-    purchased_games: List[Dict[str, str]],
-    played_games: List[Dict],
-) -> None:
-    """Attach conceptId to purchased rows so CUSA/PPSA siblings dedupe and alias."""
-    concept_by_title: Dict[str, str] = {}
-    for title in played_games:
-        if not isinstance(title, dict):
-            continue
-        concept = title.get("concept") or {}
-        concept_id = concept.get("id")
-        if concept_id is None:
-            continue
-        concept_key = str(concept_id)
-        title_id = title.get("titleId")
-        if title_id:
-            concept_by_title[title_id] = concept_key
-        for alt_id in concept.get("titleIds") or []:
-            if alt_id:
-                concept_by_title[alt_id] = concept_key
-
-    for game in purchased_games:
-        if game.get("conceptId"):
-            continue
-        concept_id = concept_by_title.get(game.get("titleId", ""))
-        if concept_id:
-            game["conceptId"] = concept_id
-
-
 def build_concept_siblings(played_games: List[Dict]) -> Dict[str, List[str]]:
     groups: Dict[str, set] = {}
     for title in played_games:
@@ -131,37 +123,6 @@ def build_concept_siblings(played_games: List[Dict]) -> Dict[str, List[str]]:
         for title_id in ordered:
             siblings[title_id] = [other for other in ordered if other != title_id]
     return siblings
-
-
-def _canonical_score(entry: Dict[str, str]) -> int:
-    title_id = entry.get("titleId") or ""
-    score = len(entry.get("name") or "")
-    if title_id.startswith("PPSA"):
-        score += 100
-    elif title_id.startswith("CUSA"):
-        score += 50
-    elif title_id.startswith("NPWR"):
-        score -= 25
-    if entry.get("source") == "purchased":
-        score += 10
-    return score
-
-
-def dedupe_library_by_concept(entries: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Keep one library row per PSN concept to avoid duplicate CUSA/PPSA pairs."""
-    by_concept: Dict[str, List[Dict[str, str]]] = {}
-    standalone: List[Dict[str, str]] = []
-    for entry in entries:
-        concept_id = entry.get("conceptId")
-        if concept_id is None:
-            standalone.append(entry)
-            continue
-        by_concept.setdefault(str(concept_id), []).append(entry)
-
-    deduped = list(standalone)
-    for group in by_concept.values():
-        deduped.append(max(group, key=_canonical_score))
-    return deduped
 
 
 def alias_context_by_siblings(

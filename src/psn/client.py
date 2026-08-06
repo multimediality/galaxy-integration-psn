@@ -34,9 +34,8 @@ from psn.graphql import played_games_url, purchased_games_url
 from psn.library_utils import (
     alias_context_by_siblings,
     build_concept_siblings,
-    dedupe_library_by_concept,
-    enrich_purchased_concept_ids,
     merge_library_entries,
+    normalize_title,
     parse_iso_datetime,
     pick_display_name,
 )
@@ -424,7 +423,26 @@ class PSNClient:
             if isinstance(title, dict)
         ]
         self._concept_siblings = build_concept_siblings(played_games)
-        enrich_purchased_concept_ids(purchased_games, played_games)
+
+        # Trophy sets already represented by a store SKU (known from the
+        # store-title mapping built during trophy imports) must not create a
+        # second entry for the same game.
+        if self._store_trophy_map is None:
+            self._store_trophy_map = self._cache_load(CACHE_STORE_TROPHY_MAP, {})
+        mapped_np_comm_ids = set()
+        for mapping in self._store_trophy_map.values():
+            trophy_sets = (
+                mapping if isinstance(mapping, list) else mapping.get("sets") or []
+            )
+            for trophy_set in trophy_sets:
+                np_comm_id = trophy_set.get("npCommunicationId")
+                if np_comm_id:
+                    mapped_np_comm_ids.add(np_comm_id)
+
+        known_names = {
+            normalize_title(entry.get("name"))
+            for entry in purchased_games + played_entries
+        }
 
         trophy_only = []
         for game in trophy_games:
@@ -432,23 +450,29 @@ class PSNClient:
                 continue
             if game["titleId"].startswith(STORE_TITLE_PREFIXES):
                 continue
+            if game["titleId"] in mapped_np_comm_ids:
+                continue
             meta = self._trophy_title_index.get(game["titleId"], {})
             platform = meta.get("platform") or ""
             if any(tag in platform for tag in ("PS4", "PS5", "PSPC")):
-                continue
+                # Modern games usually arrive via the purchased/played lists,
+                # but disc games that were sold and expired PS Plus titles
+                # exist only here (issue #48 follow-up: missing God of War).
+                # Keep them unless a purchased/played entry already carries
+                # the same name.
+                if normalize_title(game.get("name")) in known_names:
+                    continue
             trophy_only.append(game)
 
-        merged = merge_library_entries(purchased_games + played_entries + trophy_only)
-        # One library row per concept: Galaxy 2.1 shows every game_id as a
-        # separate library entry, so emitting sibling SKUs duplicates games
-        # (issue #48). Siblings are still used to alias play time and trophy
-        # contexts across regional SKUs.
-        library = dedupe_library_by_concept(merged)
+        # Emit exactly the title ids the account actually owns or played —
+        # never invent siblings (issue #48: 17x duplicates) and never merge
+        # by Sony concept (concepts group soundtracks/demos with the game,
+        # collapsing real games like KNACK 2 into their soundtrack SKU).
+        # GOG's backend stacks releases of the same game on its own.
+        library = merge_library_entries(purchased_games + played_entries + trophy_only)
         logger.info(
-            "Total library titles: %d (merged=%d, purchased=%d, played=%d, "
-            "trophy-only=%d)",
+            "Total library titles: %d (purchased=%d, played=%d, trophy-only=%d)",
             len(library),
-            len(merged),
             len(purchased_games),
             len(played_entries),
             len(trophy_only),

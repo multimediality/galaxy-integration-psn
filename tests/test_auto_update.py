@@ -174,6 +174,32 @@ async def test_detect_trophy_updates_noop_when_nothing_changed():
     assert client._http_client.calls == [TROPHY_TITLES_URL]
 
 
+@pytest.mark.asyncio
+async def test_trophy_sibling_probe_skips_unowned_skus():
+    # Tester report: trophy fetches went out for CUSA ids never sent to
+    # Galaxy — Sony concepts list regional SKUs the account doesn't own.
+    from psn.client import AchievementsContext
+    from psn.rest_urls import user_trophies_for_titles_url
+
+    owned_url = user_trophies_for_titles_url(np_title_ids="CUSA00001_00")
+    http_client = FakeHttpClient(
+        {owned_url: {"titles": [{"npTitleId": "CUSA00001_00", "trophyTitles": []}]}}
+    )
+    client = PSNClient(http_client)
+    client._owned_ids = {"CUSA00001_00"}
+    context = AchievementsContext(
+        concept_siblings={
+            "CUSA00001_00": ["CUSA24706_00", "CUSA99999_00"]  # unowned siblings
+        }
+    )
+
+    achievements = await client.fetch_unlocked_achievements("CUSA00001_00", context)
+
+    assert achievements == []
+    # Only the owned title was queried; no requests for unowned siblings.
+    assert http_client.calls == [owned_url]
+
+
 def test_exported_ids_prefer_store_titles_with_npwr_fallback():
     client = PSNClient(FakeHttpClient({}))
     client._store_trophy_map = {

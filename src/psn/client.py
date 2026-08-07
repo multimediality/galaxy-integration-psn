@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import json
 import logging
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -62,6 +64,12 @@ CACHE_PLAYED = "played_v1"
 CACHE_TROPHY_TITLES = "trophy_titles_v1"
 CACHE_TROPHIES = "trophies_v1"
 CACHE_STORE_TROPHY_MAP = "store_trophy_map_v1"
+CACHE_LIBRARY = "library_v1"
+
+# Galaxy's persistent cache stores strings; compressing large values raises
+# the effective capacity ~4-5x so trophy caches for huge libraries fit.
+CACHE_COMPRESS_THRESHOLD = 4096
+CACHE_COMPRESS_PREFIX = "z:"
 
 
 FRIENDS_PROFILE_BATCH = 8
@@ -109,6 +117,7 @@ class PSNClient:
         self._store_trophy_map: Optional[Dict[str, Any]] = None
         self._purchased_memo: Optional[Tuple[float, List[Dict[str, str]]]] = None
         self._trophy_titles_memo: Optional[Tuple[float, List[Dict[str, str]]]] = None
+        self._owned_ids: set = set()
 
     def attach_persistent_cache(
         self, getter: Callable[[], dict], pusher: Callable[[], None]
@@ -122,7 +131,13 @@ class PSNClient:
             return default
         try:
             raw = self._persistent_cache().get(key)
-            return json.loads(raw) if raw else default
+            if not raw:
+                return default
+            if isinstance(raw, str) and raw.startswith(CACHE_COMPRESS_PREFIX):
+                raw = zlib.decompress(
+                    base64.b64decode(raw[len(CACHE_COMPRESS_PREFIX) :])
+                ).decode("utf-8")
+            return json.loads(raw)
         except Exception:
             logger.warning("Could not read persistent cache key %s", key, exc_info=True)
             return default
@@ -131,7 +146,12 @@ class PSNClient:
         if self._persistent_cache is None:
             return
         try:
-            self._persistent_cache()[key] = json.dumps(value)
+            raw = json.dumps(value, separators=(",", ":"))
+            if len(raw) > CACHE_COMPRESS_THRESHOLD:
+                raw = CACHE_COMPRESS_PREFIX + base64.b64encode(
+                    zlib.compress(raw.encode("utf-8"))
+                ).decode("ascii")
+            self._persistent_cache()[key] = raw
             self._cache_dirty = True
         except Exception:
             logger.warning("Could not write persistent cache key %s", key, exc_info=True)
@@ -394,6 +414,26 @@ class PSNClient:
         return all_titles
 
     async def get_all_library_titles(self) -> List[Dict[str, str]]:
+        try:
+            library = await self._build_library_titles()
+        except Exception:
+            # Last line of defense: serve the previous complete library so a
+            # transient Sony failure never shrinks what Galaxy sees.
+            cached = self._cache_load(CACHE_LIBRARY, None)
+            if cached is None:
+                raise
+            logger.warning(
+                "Library build failed; using %d cached titles",
+                len(cached),
+                exc_info=True,
+            )
+            self._owned_ids = {title["titleId"] for title in cached}
+            return cached
+        self._cache_store(CACHE_LIBRARY, library)
+        self._owned_ids = {title["titleId"] for title in library}
+        return library
+
+    async def _build_library_titles(self) -> List[Dict[str, str]]:
         purchased_games = await self.get_purchased_games()
         try:
             played_games = await self.get_played_games()
@@ -845,6 +885,11 @@ class PSNClient:
 
                 if not achievements:
                     for sibling_id in context.concept_siblings.get(game_id, []):
+                        # Sony concepts list regional SKUs the account never
+                        # owned; probing those is a guaranteed 404 and reads
+                        # as requests for games Galaxy was never sent.
+                        if self._owned_ids and sibling_id not in self._owned_ids:
+                            continue
                         if sibling_id not in context.cache:
                             sibling_achievements = (
                                 await self._fetch_achievements_for_title(sibling_id)

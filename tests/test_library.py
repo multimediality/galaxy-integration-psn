@@ -13,6 +13,7 @@ def preset_no_mappings(client, store_ids, extra=None):
     mapping = {store_id: {"neg": FAR_FUTURE} for store_id in store_ids}
     mapping.update(extra or {})
     client._store_trophy_map = mapping
+    client._persistent_cache = None
 
 
 class StubPSNClient(PSNClient):

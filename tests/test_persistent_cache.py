@@ -4,6 +4,7 @@ import time
 import pytest
 
 from psn.client import (
+    CACHE_LIBRARY,
     CACHE_PLAYED,
     CACHE_TROPHY_TITLES,
     PSNClient,
@@ -162,6 +163,67 @@ async def test_played_games_raise_without_cache():
 
     with pytest.raises(RuntimeError):
         await client.get_played_games()
+
+
+@pytest.mark.asyncio
+async def test_full_library_served_from_cache_when_build_fails():
+    # Tester report: a failed source with no per-source cache sank the whole
+    # build even though the previous complete library was known.
+    purchased_url = purchased_games_url(start=0, size=DEFAULT_PAGE_SIZE)
+    http_client = FakeHttpClient({purchased_url: RuntimeError("expired token")})
+    client, cache = make_cached_client(http_client)
+    cached_library = [
+        {"titleId": "CUSA00001_00", "name": "Game A", "conceptId": None},
+        {"titleId": "NPWR00001_00", "name": "PS3 Game", "conceptId": None},
+    ]
+    cache[CACHE_LIBRARY] = json.dumps(cached_library)
+
+    titles = await client.get_all_library_titles()
+
+    assert titles == cached_library
+    assert client._owned_ids == {"CUSA00001_00", "NPWR00001_00"}
+
+
+def test_large_cache_values_compressed_and_roundtrip():
+    from psn.client import CACHE_COMPRESS_PREFIX
+
+    client, cache = make_cached_client(FakeHttpClient({}))
+    big = {
+        f"NPWR{i:05d}_00": {
+            "u": "2026-08-06T00:00:00Z",
+            "a": [[1754006400 + j, f"NPWR{i:05d}_00_{j}", f"Trophy Name {j}"] for j in range(30)],
+        }
+        for i in range(300)
+    }
+    client._cache_store("trophies_v1", big)
+
+    stored = cache["trophies_v1"]
+    assert stored.startswith(CACHE_COMPRESS_PREFIX)
+    assert len(stored) < len(json.dumps(big)) / 3  # at least 3x smaller
+
+    fresh, _ = make_cached_client(FakeHttpClient({}), cache)
+    assert fresh._cache_load("trophies_v1", None) == big
+
+
+def test_small_cache_values_stay_plain_and_legacy_values_load():
+    client, cache = make_cached_client(FakeHttpClient({}))
+    client._cache_store("small", {"a": 1})
+    assert cache["small"] == '{"a":1}'
+
+    # Values written by older builds (uncompressed, any size) still load.
+    legacy = [{"titleId": f"CUSA{i:05d}_00", "name": "X" * 100} for i in range(200)]
+    cache["legacy"] = json.dumps(legacy)
+    assert client._cache_load("legacy", None) == legacy
+
+
+@pytest.mark.asyncio
+async def test_library_build_failure_raises_without_cache():
+    purchased_url = purchased_games_url(start=0, size=DEFAULT_PAGE_SIZE)
+    http_client = FakeHttpClient({purchased_url: RuntimeError("expired token")})
+    client, _ = make_cached_client(http_client)
+
+    with pytest.raises(RuntimeError):
+        await client.get_all_library_titles()
 
 
 @pytest.mark.asyncio

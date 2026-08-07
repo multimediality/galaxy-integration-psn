@@ -27,6 +27,7 @@ GRAPHQL_HEADERS = {
 API_RATE_LIMIT_INTERVAL = 0.3
 API_MAX_RETRIES = 3
 API_RETRY_BACKOFF = 2.0
+API_RETRY_MAX_DELAY = 300.0
 RETRYABLE_STATUSES = frozenset({403, 429, 502, 503, 504})
 RETRYABLE_ERRORS = (BackendTimeout, BackendNotAvailable, NetworkError, TooManyRequests)
 
@@ -53,7 +54,7 @@ def _retry_delay(response, attempt: int) -> float:
     backoff = API_RETRY_BACKOFF * (2 ** attempt)
     retry_after = response.headers.get("Retry-After") if response is not None else None
     try:
-        return max(backoff, float(retry_after))
+        return min(max(backoff, float(retry_after)), API_RETRY_MAX_DELAY)
     except (TypeError, ValueError):
         return backoff
 

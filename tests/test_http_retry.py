@@ -60,6 +60,14 @@ async def test_retries_on_403_then_succeeds(monkeypatch):
     assert await client.api_get(API_URL) == {"ok": True}
 
 
+def test_retry_after_capped_at_max_delay():
+    response = FakeResponse(429, headers={"Retry-After": "3600"})
+    assert (
+        http_client_module._retry_delay(response, 0)
+        == http_client_module.API_RETRY_MAX_DELAY
+    )
+
+
 @pytest.mark.asyncio
 async def test_honors_retry_after_header(monkeypatch):
     sleeps = []

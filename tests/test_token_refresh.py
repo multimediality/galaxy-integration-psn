@@ -76,6 +76,29 @@ async def test_refresh_returns_false_without_credentials():
 
 
 @pytest.mark.asyncio
+async def test_reentrant_refresh_from_auth_flow_does_not_deadlock():
+    # The NPSSO fallback makes API calls that can 401 and re-invoke the
+    # refresher from the same task; that must return False, not deadlock.
+    http = FakeTokenHttp(status=400, body={"error": "invalid_grant"})
+    authenticator, _ = make_authenticator(
+        http, {"npsso": "np", "refresh_token": "dead-rt"}
+    )
+    inner_results = []
+
+    async def fake_npsso_auth(npsso, from_token_file=False):
+        inner_results.append(await authenticator.refresh_access_token())
+
+    authenticator._authenticate_with_npsso = fake_npsso_auth
+
+    import asyncio
+
+    outer = await asyncio.wait_for(authenticator.refresh_access_token(), timeout=2)
+
+    assert outer is True  # NPSSO fallback "succeeded" (stub didn't raise)
+    assert inner_results == [False]  # reentrant call bailed out immediately
+
+
+@pytest.mark.asyncio
 async def test_refresh_debounced_after_recent_success():
     http = FakeTokenHttp(
         body={"access_token": "new-at", "refresh_token": "new-rt"}
